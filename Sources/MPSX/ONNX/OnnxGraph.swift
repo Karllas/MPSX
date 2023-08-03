@@ -101,6 +101,8 @@ public final class OnnxGraph {
                     output = try mpsGraph.sigmoid(node, tensors)
                 case "HardSigmoid":
                     output = try mpsGraph.hardSigmoid(node, tensors)
+                case "DynamicQuantizeLinear":
+                    output = try mpsGraph.dynamicQuantizeLinear(node, tensors, constants)
                 case "Upsample",
                      "Resize":
                     output = try mpsGraph.resize(node, tensors, constants)
