@@ -37,20 +37,29 @@ extension Array {
     @usableFromInline
     var rawData: Data {
         withUnsafeBufferPointer {
-            Data(buffer: $0)
+            Data(buffer: $0) // copy
+        }
+    }
+}
+
+extension ArraySlice {
+    @usableFromInline
+    var rawData: Data {
+        withUnsafeBufferPointer {
+            Data(buffer: $0) // copy
         }
     }
 }
 
 extension Data {
-    func arrayOf<T>(_: T.Type) -> [T] {
-        let n = count / MemoryLayout<T>.stride
+    func mapMemory<T, R>(of _: T.Type, _ body: (UnsafeBufferPointer<T>) throws -> R) rethrows -> R {
+        try withUnsafeBytes {
+            try $0.withMemoryRebound(to: T.self, body)
+        }
+    }
 
-        return withUnsafeBytes {
-            $0.baseAddress
-                .flatMap { $0.bindMemory(to: T.self, capacity: n) }
-                .flatMap { Array(UnsafeBufferPointer<T>(start: $0, count: n)) }
-        } ?? []
+    func array<T>(of _: T.Type) -> [T] {
+        mapMemory(of: T.self) { Array($0) } // copy
     }
 }
 
@@ -73,29 +82,68 @@ extension [Int] {
     }
 }
 
-public extension Sequence where Element: BinaryInteger {
+extension Sequence where Element: BinaryInteger {
+    @usableFromInline
     var nsnumbers: [NSNumber] {
         map { NSNumber(value: Int($0)) }
     }
 }
 
-private extension MPSNDArray {
-    func arrayOf<T: Numeric>(_: T.Type) -> [T] {
-        let stride = MemoryLayout<T>.stride
+extension Array {
+    mutating func move(from i: Index, to j: Index) {
+        insert(remove(at: i), at: j)
+    }
+}
 
-        assert(stride == dataTypeSize)
+final class MPSImageKernels {
+    // MARK: Lifecycle
 
-        let count = (0 ..< numberOfDimensions).reduce(1) {
-            $0 * length(ofDimension: $1)
+    private init(devices: [MTLDevice]) {
+        bilinearScale = devices.reduce(into: [:]) {
+            $0[$1.registryID] = MPSImageBilinearScale(device: $1)
         }
 
-        var array = [T](repeating: 0, count: count)
-        readBytes(&array, strideBytes: nil)
-        return array
+        conversion = devices.reduce(into: [:]) {
+            $0[$1.registryID] = MPSImageConversion(device: $1)
+        }
+
+        bilinearScale.forEach {
+            $0.value.edgeMode = .clamp
+        }
     }
 
-    func bufferOf<T: Numeric>(
-        _: T.Type,
+    // MARK: Internal
+
+    #if os(macOS) || targetEnvironment(macCatalyst)
+    static let `default` = MPSImageKernels(devices: MTLCopyAllDevices().filter {
+        MPSSupportsMTLDevice($0)
+    })
+    #else
+    static let `default` = MPSImageKernels(devices: [MTLCreateSystemDefaultDevice()!])
+    #endif
+
+    let bilinearScale: [UInt64: MPSImageBilinearScale]
+    let conversion: [UInt64: MPSImageConversion]
+}
+
+extension MPSNDArray {
+    var shape: [Int] {
+        (0 ..< numberOfDimensions).map(length(ofDimension:))
+    }
+
+    func array<T: Numeric>(of _: T.Type) -> [T] {
+        assert(MemoryLayout<T>.stride == dataTypeSize)
+
+        let count = shape.reduce(1, *)
+
+        return .init(unsafeUninitializedCapacity: count) { buffer, initializedCount in
+            readBytes(buffer.baseAddress!, strideBytes: nil)
+            initializedCount = count
+        }
+    }
+
+    func buffer<T: Numeric>(
+        of _: T.Type,
         options: MTLResourceOptions,
         commandBuffer: MTLCommandBuffer
     ) -> MTLBuffer? {
@@ -103,39 +151,34 @@ private extension MPSNDArray {
 
         assert(stride == dataTypeSize)
 
-        let count = (0 ..< numberOfDimensions).reduce(1) {
-            $0 * length(ofDimension: $1)
+        let count = shape.reduce(1, *)
+
+        return device.makeBuffer(length: count * stride, options: options).flatMap {
+            exportData(
+                with: commandBuffer,
+                to: $0,
+                destinationDataType: dataType,
+                offset: 0,
+                rowStrides: nil
+            )
+            return $0
         }
-
-        guard let buffer = device.makeBuffer(length: count * stride, options: options) else {
-            return nil
-        }
-
-        exportData(
-            with: commandBuffer,
-            to: buffer,
-            destinationDataType: dataType,
-            offset: 0,
-            rowStrides: nil
-        )
-
-        return buffer
     }
 }
 
 public extension MPSNDArray {
     var floats: [Float] {
         switch dataType {
-        case .float32: return arrayOf(Float.self)
-        case .float16: return FPAC._Float16_Float32(arrayOf(Float16.self))
+        case .float32: return array(of: Float.self)
+        case .float16: return FPC._Float16_Float32(array(of: Float16.self))
 
-        case .int8: return FPAC._Int8_Float32(arrayOf(Int8.self))
-        case .int16: return FPAC._Int16_Float32(arrayOf(Int16.self))
-        case .int32: return FPAC._Int32_Float32(arrayOf(Int32.self))
+        case .int8: return FPC._Int8_Float32(array(of: Int8.self))
+        case .int16: return FPC._Int16_Float32(array(of: Int16.self))
+        case .int32: return FPC._Int32_Float32(array(of: Int32.self))
 
-        case .uInt8: return FPAC._UInt8_Float32(arrayOf(UInt8.self))
-        case .uInt16: return FPAC._UInt16_Float32(arrayOf(UInt16.self))
-        case .uInt32: return FPAC._UInt32_Float32(arrayOf(UInt32.self))
+        case .uInt8: return FPC._UInt8_Float32(array(of: UInt8.self))
+        case .uInt16: return FPC._UInt16_Float32(array(of: UInt16.self))
+        case .uInt32: return FPC._UInt32_Float32(array(of: UInt32.self))
 
         default: assertionFailure(); return []
         }
@@ -146,23 +189,23 @@ public extension MPSNDArray {
         commandBuffer: MTLCommandBuffer
     ) -> MTLBuffer? {
         switch dataType {
-        case .float32: return bufferOf(Float.self, options: options, commandBuffer: commandBuffer)
-        case .float16: return bufferOf(Float16.self, options: options, commandBuffer: commandBuffer)
+        case .float32: return buffer(of: Float.self, options: options, commandBuffer: commandBuffer)
+        case .float16: return buffer(of: Float16.self, options: options, commandBuffer: commandBuffer)
 
-        case .int8: return bufferOf(Int8.self, options: options, commandBuffer: commandBuffer)
-        case .int16: return bufferOf(Int16.self, options: options, commandBuffer: commandBuffer)
-        case .int32: return bufferOf(Int32.self, options: options, commandBuffer: commandBuffer)
+        case .int8: return buffer(of: Int8.self, options: options, commandBuffer: commandBuffer)
+        case .int16: return buffer(of: Int16.self, options: options, commandBuffer: commandBuffer)
+        case .int32: return buffer(of: Int32.self, options: options, commandBuffer: commandBuffer)
 
-        case .uInt8: return bufferOf(UInt8.self, options: options, commandBuffer: commandBuffer)
-        case .uInt16: return bufferOf(UInt16.self, options: options, commandBuffer: commandBuffer)
-        case .uInt32: return bufferOf(UInt32.self, options: options, commandBuffer: commandBuffer)
+        case .uInt8: return buffer(of: UInt8.self, options: options, commandBuffer: commandBuffer)
+        case .uInt16: return buffer(of: UInt16.self, options: options, commandBuffer: commandBuffer)
+        case .uInt32: return buffer(of: UInt32.self, options: options, commandBuffer: commandBuffer)
 
         default: assertionFailure(); return nil
         }
     }
 }
 
-private extension MPSDataType {
+extension MPSDataType {
     var matchingImageChannelFormat: MPSImageFeatureChannelFormat {
         switch self {
         case .float16: return .float16
@@ -174,55 +217,33 @@ private extension MPSDataType {
     }
 }
 
-public extension MPSGraphExecutable {
-    var feeds: [String: MPSGraphTensor] {
-        (feedTensors ?? []).reduce(into: [:]) {
-            $0[$1.operation.name] = $1
-        }
-    }
-
-    func encode(to commandBuffer: MPSCommandBuffer, inputs: [MPSGraphTensorData]) -> [MPSGraphTensorData] {
-        autoreleasepool {
-            encode(to: commandBuffer, inputs: inputs, results: nil, executionDescriptor: nil)
-        }
-    }
-
-    func encode(to commandBuffer: MPSCommandBuffer, inputs: [String: MPSGraphTensorData]) -> [MPSGraphTensorData] {
-        autoreleasepool {
-            encode(to: commandBuffer, inputs: (feedTensors ?? []).compactMap {
-                inputs[$0.operation.name]
-            }, results: nil, executionDescriptor: nil)
+extension MTLPixelFormat {
+    var featureChannels: Int {
+        switch self {
+        case .r8Unorm: return 1
+        case .rg8Unorm: return 2
+        case .rgba8Unorm: return 4
+        case .bgra8Unorm: return 4
+        case .r8Unorm_srgb: return 1
+        case .rg8Unorm_srgb: return 2
+        case .rgba8Unorm_srgb: return 4
+        case .bgra8Unorm_srgb: return 4
+        case .r16Unorm: return 1
+        case .rg16Unorm: return 2
+        case .rgba16Unorm: return 4
+        case .r16Float: return 1
+        case .rg16Float: return 2
+        case .rgba16Float: return 4
+        case .r32Float: return 1
+        case .rg32Float: return 2
+        case .rgba32Float: return 4
+        default: assertionFailure(); return .max
         }
     }
 }
 
 private extension MPSGraphTensorData {
-    func transform(in commandBuffer: MPSCommandBuffer, _ actions: [(MPSGraphTensor) -> MPSGraphTensor]) -> MPSGraphTensorData {
-        actions.isEmpty ? self : MPSCompiledGraph(device: commandBuffer.device) { graph in
-            [
-                actions.reduce(graph.placeholder(shape: shape, dataType: dataType, name: nil)) { $1($0) },
-            ]
-        }.executable.encode(to: commandBuffer, inputs: [self])[0]
-    }
-}
-
-public extension MPSGraphTensorData {
-    convenience init(floats: [Float], shape: [Int], device: MTLDevice) {
-        self.init(
-            device: .init(mtlDevice: device),
-            data: floats.rawData,
-            shape: shape.nsnumbers,
-            dataType: .float32
-        )
-    }
-
-    func transposeNHWC(in commandBuffer: MPSCommandBuffer) -> MPSGraphTensorData {
-        transform(in: commandBuffer, [
-            { $0.transpose(1, 2).transpose(2, 3) },
-        ])
-    }
-
-    func temporaryImage(in commandBuffer: MPSCommandBuffer) -> MPSTemporaryImage {
+    func toImage(in commandBuffer: MPSCommandBuffer) -> MPSTemporaryImage {
         assert(shape.count == 4)
 
         let shape = shape.map(\.intValue)
@@ -249,32 +270,83 @@ public extension MPSGraphTensorData {
 
         return image
     }
+}
 
-    func texture2D(
-        pixelFormat: MTLPixelFormat,
-        converter: MPSImageConversion,
+public extension MPSGraphTensorData {
+    static func floats(_ array: [Float], shape: [Int]? = nil, device: MTLDevice) -> MPSGraphTensorData {
+        let shape = shape ?? [array.count]
+
+        assert(shape.reduce(1, *) == array.count)
+
+        return .init(
+            device: .init(mtlDevice: device),
+            data: array.rawData,
+            shape: shape.nsnumbers,
+            dataType: .float32
+        )
+    }
+
+    func temporaryImage(
+        pixelFormat: MTLPixelFormat? = nil,
         in commandBuffer: MPSCommandBuffer
-    ) -> MTLTexture {
-        let image = temporaryImage(in: commandBuffer)
-        defer { image.readCount = 0 }
+    ) -> MPSTemporaryImage {
+        let source = toImage(in: commandBuffer)
+
+        guard let pixelFormat, pixelFormat != source.pixelFormat else {
+            return source
+        }
 
         let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: pixelFormat,
-            width: image.width,
-            height: image.height,
+            width: source.width,
+            height: source.height,
+            mipmapped: false
+        )
+        textureDescriptor.usage = [.shaderRead, .shaderWrite]
+        textureDescriptor.storageMode = .private
+
+        let destination = MPSTemporaryImage(
+            commandBuffer: commandBuffer,
+            textureDescriptor: textureDescriptor
+        )
+        destination.readCount = .max
+
+        MPSImageKernels.default.conversion[commandBuffer.device.registryID]!.encode(
+            commandBuffer: commandBuffer,
+            sourceTexture: source.texture,
+            destinationTexture: destination.texture
+        )
+
+        source.readCount = 0
+
+        return destination
+    }
+
+    func texture(
+        pixelFormat: MTLPixelFormat,
+        in commandBuffer: MPSCommandBuffer
+    ) -> MTLTexture {
+        let source = toImage(in: commandBuffer)
+
+        let textureDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: pixelFormat,
+            width: source.width,
+            height: source.height,
             mipmapped: false
         )
         textureDescriptor.usage = [.shaderRead, .shaderWrite]
 
-        let texture = commandBuffer.device.makeTexture(descriptor: textureDescriptor)!
+        let destination = commandBuffer.device.makeTexture(descriptor: textureDescriptor)!
 
-        converter.encode(
+        MPSImageKernels.default.conversion[commandBuffer.device.registryID]!.encode(
             commandBuffer: commandBuffer,
-            sourceTexture: image.texture,
-            destinationTexture: texture
+            sourceTexture: source.texture,
+            destinationTexture: destination
         )
 
-        return texture
+        source.readCount = 0
+
+        return destination
     }
 
     func synchronizedNDArray(in commandBuffer: MTLCommandBuffer) -> MPSNDArray {
@@ -284,15 +356,17 @@ public extension MPSGraphTensorData {
     }
 }
 
-private extension MPSImage {
-    func tensorData(dataType: MPSDataType, in commandBuffer: MPSCommandBuffer) -> MPSGraphTensorData {
+public extension MPSImage {
+    func toNDArray(dataType: MPSDataType, in commandBuffer: MPSCommandBuffer) -> MPSTemporaryNDArray {
         let array = MPSTemporaryNDArray(
             commandBuffer: commandBuffer,
             descriptor: .init(
                 dataType: dataType,
                 shape: [numberOfImages, height, width, featureChannels].nsnumbers
             )
-        ) // no readCount = 0 here -> next steps in pipeline will do this automatically
+        )
+
+        array.readCount = .max
 
         array.importData(
             with: commandBuffer,
@@ -300,113 +374,66 @@ private extension MPSImage {
             offset: .init()
         )
 
-        return .init(array)
+        return array
     }
 }
 
-public extension MPSGraphTensorData {
-    static func from(
-        image: MPSImage,
-        tensorShape: [Int],
-        tensorDataType: MPSDataType,
-        resizeMode: MPSGraphResizeMode = .bilinear,
-        channelsFirst: Bool,
+public extension MTLTexture {
+    func toNDArray(
+        dataType: MPSDataType,
+        featureChannels: Int,
+        targetWidth: Int,
+        targetHeight: Int,
         in commandBuffer: MPSCommandBuffer
-    ) -> MPSGraphTensorData {
-        let (c, h, w) = channelsFirst ? (tensorShape[1], tensorShape[2], tensorShape[3]) : (tensorShape[3], tensorShape[1], tensorShape[2])
+    ) -> MPSTemporaryNDArray {
+        assert(textureType == .type2D)
 
-        precondition(tensorShape.count == 4 && tensorShape[0] == 1 && image.featureChannels == c)
+        let mpsImage = MPSImage(
+            texture: self,
+            featureChannels: featureChannels > 0 ? featureChannels : min(3, pixelFormat.featureChannels)
+        )
 
-        let data = autoreleasepool {
-            image.tensorData(dataType: tensorDataType, in: commandBuffer)
+        if targetHeight < 0 || targetWidth < 0 || (mpsImage.height == targetHeight && mpsImage.width == targetWidth) {
+            let ndArray = mpsImage.toNDArray(dataType: dataType, in: commandBuffer)
+
+            return ndArray
         }
 
-        let dataShape = data.shape.map(\.intValue)
+        let tmpImage = MPSTemporaryImage(
+            commandBuffer: commandBuffer,
+            imageDescriptor: .init(
+                channelFormat: mpsImage.featureChannelFormat,
+                width: targetWidth,
+                height: targetHeight,
+                featureChannels: mpsImage.featureChannels
+            )
+        )
 
-        var transformers: [(MPSGraphTensor) -> MPSGraphTensor] = []
+        tmpImage.readCount = .max
 
-        if dataShape[1] != h || dataShape[2] != w {
-            transformers.append {
-                $0.resize(mode: resizeMode, layout: .NHWC, height: h, width: w)
-            }
-        }
+        MPSImageKernels.default.bilinearScale[commandBuffer.device.registryID]!.encode(
+            commandBuffer: commandBuffer,
+            sourceImage: mpsImage,
+            destinationImage: tmpImage
+        )
 
-        if channelsFirst {
-            transformers.append {
-                $0.transpose(2, 3).transpose(1, 2)
-            }
-        }
+        let ndArray = tmpImage.toNDArray(dataType: dataType, in: commandBuffer)
 
-        return data.transform(in: commandBuffer, transformers)
+        tmpImage.readCount = 0
+
+        return ndArray
     }
 }
 
-public extension MPSGraphTensorData {
-    @inlinable
-    static func NHWC(
-        texture: MTLTexture,
-        tensorShape: [Int],
-        tensorDataType: MPSDataType,
-        resizeMode: MPSGraphResizeMode = .bilinear,
-        in commandBuffer: MPSCommandBuffer
-    ) -> MPSGraphTensorData {
-        from(
-            image: .init(texture: texture, featureChannels: tensorShape[3]),
-            tensorShape: tensorShape,
-            tensorDataType: tensorDataType,
-            resizeMode: resizeMode,
-            channelsFirst: false,
-            in: commandBuffer
-        )
+public extension MPSGraph {
+    convenience init(options: MPSGraphOptions) {
+        self.init()
+        self.options = options
     }
+}
 
-    @inlinable
-    static func NCHW(
-        texture: MTLTexture,
-        tensorShape: [Int],
-        tensorDataType: MPSDataType,
-        resizeMode: MPSGraphResizeMode = .bilinear,
-        in commandBuffer: MPSCommandBuffer
-    ) -> MPSGraphTensorData {
-        from(
-            image: .init(texture: texture, featureChannels: tensorShape[1]),
-            tensorShape: tensorShape,
-            tensorDataType: tensorDataType,
-            resizeMode: resizeMode,
-            channelsFirst: true,
-            in: commandBuffer
-        )
-    }
-
-    @inlinable
-    static func NHWC(
-        texture: MTLTexture,
-        tensor: MPSGraphTensor,
-        resizeMode: MPSGraphResizeMode = .bilinear,
-        in commandBuffer: MPSCommandBuffer
-    ) -> MPSGraphTensorData {
-        NHWC(
-            texture: texture,
-            tensorShape: (tensor.shape ?? []).map(\.intValue),
-            tensorDataType: tensor.dataType,
-            resizeMode: resizeMode,
-            in: commandBuffer
-        )
-    }
-
-    @inlinable
-    static func NCHW(
-        texture: MTLTexture,
-        tensor: MPSGraphTensor,
-        resizeMode: MPSGraphResizeMode = .bilinear,
-        in commandBuffer: MPSCommandBuffer
-    ) -> MPSGraphTensorData {
-        NCHW(
-            texture: texture,
-            tensorShape: (tensor.shape ?? []).map(\.intValue),
-            tensorDataType: tensor.dataType,
-            resizeMode: resizeMode,
-            in: commandBuffer
-        )
+public extension MPSGraphTensor {
+    var ishape: [Int] {
+        shape?.map(\.intValue) ?? []
     }
 }

@@ -8,53 +8,29 @@ import XCTest
 final class OnnxTests: XCTestCase {
     // https://github.com/onnx/models/tree/main/vision/classification/shufflenet
     func testShuffleNet() async throws {
-        // STEP 0️⃣: setup model and imagenet labels
-
-        // ⚠️⚠️⚠️ You can find required files in 1.1.1 release attachments
-
-        let model = try OnnxModel(data: data(arg: 2)) // shufflenet-v2-12.onnx
-        let labels = try String(data: data(arg: 3), encoding: .utf8)!.split(separator: "\n") // imagenet_classes.txt
-
-        // STEP 1️⃣: setup metal stuff
+        let model = try OnnxModel(data: data(bundlePath: "\(testResourcesPath)/shufflenet-v2-12.onnx"))
+        let labels = try String(data: data(bundlePath: "\(testResourcesPath)/imagenet_classes.txt"), encoding: .utf8)!.split(separator: "\n")
+        let inputTexture = try await texture(bundlePath: "\(testResourcesPath)/tiger.jpg")
 
         let gpu = GPU.default
 
-        // STEP 2️⃣: create onnx graph using model instance, metal device and graph configuration
-
-        let graph = try OnnxGraph(
-            model: model,
+        let graph = try MPSCompiledGraph(
+            onnxModel: model,
             device: gpu.device,
             config: .init(
+                inputs: [model.inputs[0].name: .init(isImage: true)],
                 outputs: [model.outputs[0]: .init(valuesRange: [-10, 10])],
-                tensorsDataType: .fp16 // .fp32
+                tensorsDataType: .fp16
             )
         )
 
-        // STEP 3️⃣: prepare inputs and warm up graph
-
-        let inputTexture = try await inputTexture(arg: 1)
-
-        let input: MPSGraphTensorData = gpu.commandQueue.sync {
-            // ❕ This call is optional: first run of the graph is slower than the others, so for clear measurements we perform warm-up.
-
+        gpu.commandQueue.sync {
             graph.warmUp(in: $0)
-
-            // ❕ MTLTexture -> MPSGraphTensorData transformation is tricky, so MPSX has a handy API for that.
-
-            // ⚠️⚠️⚠️ This method automatically resizes input image to match input shape. Please keep in mind to feed unstretched square image to the graph for correct predictions. This behavior is model specific.
-            return .NCHW(
-                texture: inputTexture,
-                tensorShape: graph.inputShapes.first!.value,
-                tensorDataType: graph.inputDataTypes.first!.value,
-                in: $0
-            )
         }
 
-        // STEP 4️⃣: measure and run
-
-        func predict() -> MPSNDArray {
+        func predict() -> MPSGraphTensorData {
             gpu.commandQueue.sync {
-                graph.encode(to: $0, inputs: [input])[0].synchronizedNDArray(in: $0)
+                graph(.texture(inputTexture), in: $0)
             }
         }
 
@@ -62,60 +38,41 @@ final class OnnxTests: XCTestCase {
             _ = predict()
         }
 
-        predict().floats.enumerated().sorted(by: { $0.element > $1.element }).prefix(3).forEach {
-            print(labels[$0.offset])
+        let rawData = predict()
+
+        let ndarray = gpu.commandQueue.sync {
+            rawData.synchronizedNDArray(in: $0)
         }
+
+        let top = labels[ndarray.floats.enumerated().sorted(by: { $0.element > $1.element })[0].offset]
+
+        XCTAssert(top == "tiger")
     }
 
     // https://github.com/onnx/models/tree/main/vision/style_transfer/fast_neural_style
     func testStyleTransfer() async throws {
-        // STEP 0️⃣: setup model
-
-        // ⚠️⚠️⚠️ You can find required files in 1.1.1 release attachments
-
-        let model = try OnnxModel(data: data(arg: 3)) // candy-8.onnx
-
-        // STEP 1️⃣: setup metal stuff
+        let model = try OnnxModel(data: data(bundlePath: "\(testResourcesPath)/candy-8.onnx"))
+        let inputImage = try await texture(bundlePath: "\(testResourcesPath)/tiger.jpg")
 
         let gpu = GPU.default
 
-        // STEP 2️⃣: create onnx graph using model instance, metal device and graph configuration
-
-        let graph = try OnnxGraph(
-            model: model,
+        let graph = try MPSCompiledGraph(
+            onnxModel: model,
             device: gpu.device,
             config: .init(
-                outputs: [model.outputs[0]: .init(valuesRange: .init(0, 255))],
-                tensorsDataType: .fp16 // .fp32
+                inputs: [model.inputs[0].name: .init(isImage: true)],
+                outputs: [model.outputs[0]: .init(valuesRange: .init(0, 255), isImage: true)],
+                tensorsDataType: .fp16
             )
         )
 
-        // STEP 3️⃣: prepare inputs and warm up graph
-
-        let inputTexture = try await inputTexture(arg: 1)
-
-        let input: MPSGraphTensorData = gpu.commandQueue.sync {
-            // ❕ This call is optional: first run of the graph is slower than the others, so for clear measurements we perform warm-up.
-
+        gpu.commandQueue.sync {
             graph.warmUp(in: $0)
-
-            return .NCHW(
-                texture: inputTexture,
-                tensorShape: graph.inputShapes.first!.value,
-                tensorDataType: graph.inputDataTypes.first!.value,
-                in: $0
-            )
         }
 
-        // STEP 4️⃣: measure and run
-
-        func styleTransfer() -> MTLTexture {
+        func styleTransfer() -> MPSGraphTensorData {
             gpu.commandQueue.sync {
-                graph.encode(to: $0, inputs: [input])[0].transposeNHWC(in: $0).texture2D(
-                    pixelFormat: .rgba8Unorm,
-                    converter: gpu.imageConverter,
-                    in: $0
-                )
+                graph(.texture(inputImage), in: $0)
             }
         }
 
@@ -123,6 +80,14 @@ final class OnnxTests: XCTestCase {
             _ = styleTransfer()
         }
 
-        try save(texture: styleTransfer(), arg: 2)
+        let rawData = styleTransfer()
+
+        let outputTexture = gpu.commandQueue.sync {
+            rawData.texture(pixelFormat: .rgba8Unorm, in: $0)
+        }
+
+        let reference = try await texture(bundlePath: "\(testResourcesPath)/candy-8-tiger.jpg")
+
+        XCTAssert(compare(texture: outputTexture, with: reference))
     }
 }

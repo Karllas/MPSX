@@ -12,11 +12,12 @@ extension MPSGraph {
         else { throw OnnxError.invalidInput(node.name) }
 
         let keepDims = (node.attr(i: "keepdims") ?? 1) > 0
+        var output = input.mean(axes: axes)
 
-        var output = mean(of: input, axes: axes.nsnumbers, name: nil)
+        // TODO: support noop_with_empty_axes
 
         if !keepDims {
-            output = output.squeeze()
+            output = output.squeeze(axes)
         }
 
         return output

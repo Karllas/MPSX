@@ -3,8 +3,6 @@ import Foundation
 public final class OnnxModel {
     // MARK: Lifecycle
 
-    /// Initialize an instance of the onnx model with some preparation for later compilation of the mps graph
-    /// - Parameter data: onnx protobuf bytes
     public init(data: Data) throws {
         let proto = try Onnx_ModelProto(serializedData: data)
 
@@ -45,6 +43,8 @@ public final class OnnxModel {
         self.initializer = initializer
         self.inputs = inputs
         self.outputs = outputs
+
+        optimizedForMPS = proto.producerName == "MPSX"
     }
 
     // MARK: Public
@@ -61,4 +61,5 @@ public final class OnnxModel {
 
     let proto: Onnx_ModelProto
     let initializer: [String: Onnx_TensorProto]
+    let optimizedForMPS: Bool
 }

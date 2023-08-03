@@ -7,18 +7,20 @@ extension MPSGraph {
         _ tensors: [String: MPSGraphTensor]
     ) throws -> MPSGraphTensor {
         guard let input = tensors(node.input(0)),
+              let shape = input.shape,
               let gamma = tensors(node.input(1)),
               let beta = tensors(node.input(2)),
               let mean = tensors(node.input(3)),
               let variance = tensors(node.input(4))
         else { throw OnnxError.invalidInput(node.name) }
 
+        let extraDims = shape.count - 2
         let output = normalize(
             input,
-            mean: reshapeHW(mean),
-            variance: reshapeHW(variance),
-            gamma: reshapeHW(gamma),
-            beta: reshapeHW(beta),
+            mean: appendDimsIfNeeded(to: mean, count: extraDims),
+            variance: appendDimsIfNeeded(to: variance, count: extraDims),
+            gamma: appendDimsIfNeeded(to: gamma, count: extraDims),
+            beta: appendDimsIfNeeded(to: beta, count: extraDims),
             epsilon: node.attr(f: "epsilon") ?? 1e-05,
             name: nil
         )
@@ -36,17 +38,19 @@ extension MPSGraph {
               let beta = tensors(node.input(2))
         else { throw OnnxError.invalidInput(node.name) }
 
-        let axes: [NSNumber] = [2, 3]
+        guard let shape = input.shape, shape.count > 2 else {
+            throw OnnxError.invalidInput(node.name)
+        }
 
-        let mean = mean(of: input, axes: axes, name: nil)
-        let variance = variance(of: input, mean: mean, axes: axes, name: nil)
+        let (mean, variance) = input.meanAndVariance(axes: Array(2 ..< shape.count))
 
+        let extraDims = shape.count - 2
         let output = normalize(
             input,
             mean: mean,
             variance: variance,
-            gamma: reshapeHW(gamma),
-            beta: reshapeHW(beta),
+            gamma: appendDimsIfNeeded(to: gamma, count: extraDims),
+            beta: appendDimsIfNeeded(to: beta, count: extraDims),
             epsilon: node.attr(f: "epsilon") ?? 1e-05,
             name: nil
         )
@@ -104,25 +108,22 @@ extension MPSGraph {
 
         let s = c / g
 
-        let x = input.reshape([-1, g, s, h, w].nsnumbers)
+        let x = input.reshape([-1, g, s, h, w])
 
-        let axes: [NSNumber] = [2, 3, 4]
+        let (mean, variance) = x.meanAndVariance(axes: [2, 3, 4])
 
-        let mean = mean(of: x, axes: axes, name: nil)
-        let variance = variance(of: x, mean: mean, axes: axes, name: nil)
-
-        let newShape = [1, g, s, 1, 1].nsnumbers
+        let newShape = [1, g, s, 1, 1]
 
         let output = normalize(
             x,
             mean: mean,
             variance: variance,
-            gamma: reshape(gamma, shape: newShape, name: nil),
-            beta: reshape(beta, shape: newShape, name: nil),
+            gamma: gamma.reshape(newShape),
+            beta: beta.reshape(newShape),
             epsilon: epsilon ?? 1e-05,
             name: nil
         )
 
-        return output.reshape(input.shape!)
+        return output.reshape([origShape.0, origShape.1, origShape.2, origShape.3])
     }
 }

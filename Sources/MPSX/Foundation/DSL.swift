@@ -6,7 +6,7 @@ public extension MPSGraph {
         constant(vector.rawData, shape: (shape ?? [vector.count]).nsnumbers, dataType: .float32)
     }
 
-    #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
+    #if arch(arm64)
     @inlinable
     func const(_ vector: [Swift.Float16], shape: [Int]? = nil) -> MPSGraphTensor {
         constant(vector.rawData, shape: (shape ?? [vector.count]).nsnumbers, dataType: .float16)
@@ -33,8 +33,8 @@ public extension MPSGraphTensor {
     }
 
     @inlinable
-    func reshape(_ shape: [NSNumber]) -> MPSGraphTensor {
-        operation.graph.reshape(self, shape: shape, name: nil)
+    func reshape(_ shape: [Int]) -> MPSGraphTensor {
+        operation.graph.reshape(self, shape: shape.nsnumbers, name: nil)
     }
 
     @inlinable
@@ -61,7 +61,7 @@ public extension MPSGraphTensor {
             return self
         }
 
-        return reshape(shape.map(\.intValue).squeeze(axes: axes).nsnumbers)
+        return reshape(shape.map(\.intValue).squeeze(axes: axes))
     }
 
     func unsqueeze(_ axes: [Int]) -> MPSGraphTensor {
@@ -77,7 +77,7 @@ public extension MPSGraphTensor {
             return self
         }
 
-        return reshape(shape.map(\.intValue).unsqueeze(axes: axes).nsnumbers)
+        return reshape(shape.map(\.intValue).unsqueeze(axes: axes))
     }
 
     func transpose(_ permutation: [Int]) -> MPSGraphTensor {
@@ -115,6 +115,41 @@ public extension MPSGraphTensor {
         }
 
         return output
+    }
+
+    @inlinable
+    func toNHWC() -> MPSGraphTensor {
+        assert(shape?.count == 4, "Operation \(#function) should be performed on 4 dimensional tensors")
+        return transpose([0, 2, 3, 1])
+    }
+
+    @inlinable
+    func toNCHW() -> MPSGraphTensor {
+        assert(shape?.count == 4, "Operation \(#function) should be performed on 4 dimensional tensors")
+        return transpose([0, 3, 1, 2])
+    }
+}
+
+public extension MPSGraphTensor {
+    @inlinable
+    func mean(axes: [Int]) -> MPSGraphTensor {
+        operation.graph.mean(of: self, axes: axes.nsnumbers, name: nil)
+    }
+
+    @inlinable
+    func variance(axes: [Int], mean: MPSGraphTensor? = nil) -> MPSGraphTensor {
+        if let mean {
+            return operation.graph.variance(of: self, mean: mean, axes: axes.nsnumbers, name: nil)
+        }
+        return operation.graph.variance(of: self, axes: axes.nsnumbers, name: nil)
+    }
+
+    @inlinable
+    func meanAndVariance(axes: [Int]) -> (mean: MPSGraphTensor, variance: MPSGraphTensor) {
+        let axes = axes.nsnumbers
+        let mean = operation.graph.mean(of: self, axes: axes, name: nil)
+        let variance = operation.graph.variance(of: self, mean: mean, axes: axes, name: nil)
+        return (mean, variance)
     }
 }
 
@@ -330,8 +365,13 @@ public extension MPSGraphTensor {
     }
 
     @inlinable
-    func mean(axes: [Int]) -> MPSGraphTensor {
-        operation.graph.mean(of: self, axes: axes.nsnumbers, name: nil)
+    func argmax(axis: Int) -> MPSGraphTensor {
+        operation.graph.reductionArgMaximum(with: self, axis: axis, name: nil)
+    }
+
+    @inlinable
+    func argmin(axis: Int) -> MPSGraphTensor {
+        operation.graph.reductionArgMinimum(with: self, axis: axis, name: nil)
     }
 }
 
@@ -367,6 +407,11 @@ public extension MPSGraphTensor {
     }
 
     @inlinable
+    func square() -> MPSGraphTensor {
+        operation.graph.square(with: self, name: nil)
+    }
+
+    @inlinable
     func ceil() -> MPSGraphTensor {
         operation.graph.ceil(with: self, name: nil)
     }
@@ -383,6 +428,49 @@ public extension MPSGraphTensor {
 }
 
 public extension MPSGraphTensor {
+    @inlinable
+    func pad(
+        mode: MPSGraphPaddingMode,
+        top: Int,
+        bottom: Int,
+        left: Int,
+        right: Int,
+        constant: Double = .zero,
+        channelsFirst: Bool = true
+    ) -> MPSGraphTensor {
+        operation.graph.padTensor(
+            self,
+            with: mode,
+            leftPadding: channelsFirst ? [0, 0, top, left].nsnumbers : [0, top, left, 0].nsnumbers,
+            rightPadding: channelsFirst ? [0, 0, bottom, right].nsnumbers : [0, bottom, right, 0].nsnumbers,
+            constantValue: constant,
+            name: nil
+        )
+    }
+
+    @inlinable
+    func slice(
+        axis: Int,
+        start: Int,
+        length: Int
+    ) -> MPSGraphTensor {
+        operation.graph.sliceTensor(
+            self,
+            dimension: axis,
+            start: start,
+            length: length,
+            name: nil
+        )
+    }
+
+    @available(iOS 16.0, macOS 13.0, *)
+    func sort(axis: Int, descending: Bool = false) -> MPSGraphTensor {
+        if descending {
+            return operation.graph.sort(self, axis: axis, descending: true, name: nil)
+        }
+        return operation.graph.sort(self, axis: axis, name: nil)
+    }
+
     @inlinable
     func resize(
         mode: MPSGraphResizeMode,
@@ -404,12 +492,17 @@ public extension MPSGraphTensor {
 
 public extension MPSGraph {
     @inlinable
+    func placeholder(ishape: [Int], dataType: MPSDataType, name: String) -> MPSGraphTensor {
+        placeholder(shape: ishape.nsnumbers, dataType: dataType, name: name)
+    }
+
+    @inlinable
     func imagePlaceholder(
         dataType: MPSDataType,
         channels: Int,
         height: Int,
         width: Int,
-        name: String? = nil
+        name: String
     ) -> MPSGraphTensor {
         placeholder(shape: [1, channels, height, width].nsnumbers, dataType: dataType, name: name)
     }
@@ -420,7 +513,7 @@ public extension MPSGraph {
         height: Int,
         width: Int,
         channels: Int,
-        name: String? = nil
+        name: String
     ) -> MPSGraphTensor {
         placeholder(shape: [1, height, width, channels].nsnumbers, dataType: dataType, name: name)
     }
