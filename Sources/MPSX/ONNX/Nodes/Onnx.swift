@@ -129,6 +129,8 @@ extension MPSGraph {
                 tensors[$0.0] = $0.1
             }
             return true
+        case "DynamicQuantizeLinear":
+            output = try dynamicQuantizeLinear(node, tensors, constants)
         default:
             return false
         }
